@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any
 from contextlib import asynccontextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from datetime import timedelta
 
 from openai import AsyncOpenAI
 from telegram import Update
@@ -116,7 +115,6 @@ DEBUG_TOOL_ARGS_PREVIEW_CHARS = int(
 )
 
 MCP_TOOL_CALL_TIMEOUT = int(os.getenv("MCP_TOOL_CALL_TIMEOUT", "60"))
-MCP_SSE_READ_TIMEOUT = int(os.getenv("MCP_SSE_READ_TIMEOUT", "300"))
 
 if not TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN")
@@ -504,10 +502,9 @@ async def mcp_session():
     if not MCP_ENABLED:
         raise RuntimeError("MCP disabled")
 
-    async with streamablehttp_client(
-        MCP_URL,
-        sse_read_timeout=timedelta(seconds=MCP_SSE_READ_TIMEOUT),
-    ) as transport:
+    # NOTE: removed sse_read_timeout kwarg to support older mcp SDK versions.
+    # The tool call timeout is enforced via asyncio.wait_for in call_mcp_tool.
+    async with streamablehttp_client(MCP_URL) as transport:
         if isinstance(transport, (tuple, list)):
             read = transport[0]
             write = transport[1]
