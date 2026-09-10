@@ -9,6 +9,7 @@ Behavior:
 - /clear_memory -> wipes this chat from disk/RAM and disables tools
 - Before /save_memory: context is RAM-only, no disk write, no MCP tools
 - After /clear_memory: nothing is kept
+- Sends Telegram debug/status messages while thinking and using tools
 
 Commands:
   /save_memory or /save
@@ -88,10 +89,29 @@ SYSTEM_PROMPT = os.getenv(
     ),
 )
 
-MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "6"))
-MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "120"))
-MAX_CONTEXT_MESSAGES = int(os.getenv("MAX_CONTEXT_MESSAGES", "40"))
+MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "30"))
+MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "220"))
+MAX_CONTEXT_MESSAGES = int(os.getenv("MAX_CONTEXT_MESSAGES", "80"))
 MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "12000"))
+
+TELEGRAM_DEBUG = os.getenv("TELEGRAM_DEBUG", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "",
+}
+DEBUG_TOOL_RESULTS = os.getenv("DEBUG_TOOL_RESULTS", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "",
+}
+DEBUG_TOOL_RESULT_PREVIEW_CHARS = int(
+    os.getenv("DEBUG_TOOL_RESULT_PREVIEW_CHARS", "700")
+)
+DEBUG_TOOL_ARGS_PREVIEW_CHARS = int(
+    os.getenv("DEBUG_TOOL_ARGS_PREVIEW_CHARS", "300")
+)
 
 if not TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN")
@@ -122,7 +142,17 @@ def normalize_text(value: Any) -> str:
         return str(value)
 
 
-def split_text(text: str, limit: int = 4000) -> list[str]:
+async def send_debug(bot, chat_id: int, text: str):
+    if not TELEGRAM_DEBUG or bot is None or not text:
+        return
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=str(text)[:3900])
+    except Exception as e:
+        log.warning("Debug send failed: %s", e)
+
+
+def split_text(text: str, limit: int = 4000) -> list:
     text = str(text or "").strip()
     if not text:
         return ["(empty response)"]
@@ -133,8 +163,12 @@ def safe_tool_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", name)[:64] or "tool"
 
 
-def message_groups(messages: list[dict]) -> list[list[dict]]:
-    groups: list[list[dict]] = []
+def message_groups(messages: list) -> list:
+    """
+    Groups assistant tool_calls together with their matching tool responses.
+    Prevents truncation from leaving orphan tool messages.
+    """
+    groups = []
     i = 0
 
     while i < len(messages):
@@ -168,9 +202,11 @@ def message_groups(messages: list[dict]) -> list[list[dict]]:
                 else:
                     break
 
+            # Keep only complete tool-call/tool-result groups.
             if not needed:
                 groups.append(group)
         else:
+            # Skip orphan tool messages.
             if role != "tool":
                 groups.append([msg])
             i += 1
@@ -178,14 +214,14 @@ def message_groups(messages: list[dict]) -> list[list[dict]]:
     return groups
 
 
-def safe_tail(messages: list[dict], limit: int) -> list[dict]:
+def safe_tail(messages: list, limit: int) -> list:
     if limit <= 0:
         return []
     if len(messages) <= limit:
         return messages
 
     groups = message_groups(messages)
-    out: list[dict] = []
+    out = []
     count = 0
 
     for group in reversed(groups):
@@ -201,6 +237,9 @@ def safe_tail(messages: list[dict], limit: int) -> list[dict]:
 
 
 def sanitize_schema(schema: Any) -> dict:
+    """
+    Minimal OpenAI-compatible JSON schema sanitizer.
+    """
     if not isinstance(schema, dict):
         return {"type": "object", "properties": {}}
 
@@ -225,10 +264,16 @@ def sanitize_schema(schema: Any) -> dict:
     return out
 
 
-def mcp_tools_to_openai_tools(tools: list) -> tuple[list[dict], dict[str, str]]:
-    out: list[dict] = []
-    name_map: dict[str, str] = {}
-    used: set[str] = set()
+def mcp_tools_to_openai_tools(tools: list) -> tuple:
+    """
+    Converts MCP tools to OpenAI function tools.
+    Returns:
+      tools, name_map
+      name_map maps sanitized OpenAI function name -> original MCP tool name.
+    """
+    out = []
+    name_map = {}
+    used = set()
 
     for t in tools:
         original_name = getattr(t, "name", None)
@@ -271,7 +316,7 @@ def serialize_mcp_result(result: Any) -> str:
     if content is None:
         return prefix + str(result)
 
-    parts: list[str] = []
+    parts = []
 
     for item in content:
         text = getattr(item, "text", None)
@@ -285,14 +330,26 @@ def serialize_mcp_result(result: Any) -> str:
     return prefix + ("\n".join(parts) if parts else str(result))
 
 
+def truncate_preview(text: str, limit: int) -> str:
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n..."
+
+
 # -----------------------------
 # Memory
 # -----------------------------
 
 class Memory:
+    """
+    RAM context for all chats.
+    Disk persistence only for chats where active == True.
+    """
+
     def __init__(self, path: Path):
         self.path = path
-        self.data: dict[str, dict] = {}
+        self.data = {}
         self.load()
 
     def load(self):
@@ -310,6 +367,7 @@ class Memory:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
 
+            # Persist only active chats.
             persistent = {
                 chat_id: state
                 for chat_id, state in self.data.items()
@@ -386,7 +444,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             "telegram_allowlist_configured": bool(ALLOWED_USER_IDS),
         }
 
-    def _send(self, code: int, payload: dict | None = None, head_only: bool = False):
+    def _send(self, code: int, payload=None, head_only: bool = False):
         body = b"" if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
         self.send_response(code)
@@ -470,13 +528,16 @@ async def call_mcp_tool(session, name: str, arguments: dict) -> str:
 
 async def complete_with_tools(
     chat_id: int,
-    messages: list[dict],
-    tools: list[dict],
-    tool_name_map: dict[str, str],
+    messages: list,
+    tools: list,
+    tool_name_map: dict,
     session,
     active: bool,
+    bot=None,
 ) -> str:
-    for _ in range(MAX_TOOL_ROUNDS):
+    for round_num in range(1, MAX_TOOL_ROUNDS + 1):
+        await send_debug(bot, chat_id, f"Thinking... (round {round_num}/{MAX_TOOL_ROUNDS})")
+
         kwargs = {}
         if tools:
             kwargs["tools"] = tools
@@ -488,8 +549,10 @@ async def complete_with_tools(
                 **kwargs,
             )
         except Exception as e:
+            # If provider rejects tool schema, retry once without tools.
             if tools:
                 log.warning("LLM rejected tools; retrying without tools: %s", e)
+                await send_debug(bot, chat_id, f"Tool schema rejected. Retrying without tools: {e}")
                 tools = []
                 tool_name_map = {}
                 session = None
@@ -519,6 +582,12 @@ async def complete_with_tools(
             messages.append(assistant_msg)
             memory.add(chat_id, assistant_msg)
 
+            await send_debug(
+                bot,
+                chat_id,
+                f"Agent requested {len(tool_calls)} tool call(s).",
+            )
+
             for tc in tool_calls:
                 fn = getattr(tc, "function", None)
                 if fn is None:
@@ -537,6 +606,15 @@ async def complete_with_tools(
 
                 original_mcp_tool_name = tool_name_map.get(function_name, function_name)
 
+                await send_debug(bot, chat_id, f"Using tool: {original_mcp_tool_name}")
+
+                if DEBUG_TOOL_RESULTS:
+                    args_preview = truncate_preview(
+                        normalize_text(args),
+                        DEBUG_TOOL_ARGS_PREVIEW_CHARS,
+                    )
+                    await send_debug(bot, chat_id, f"Tool args:\n{args_preview}")
+
                 try:
                     if session is None:
                         result = (
@@ -552,6 +630,19 @@ async def complete_with_tools(
                 except Exception as e:
                     log.exception("MCP tool call failed: %s", original_mcp_tool_name)
                     result = f"Tool call failed: {e}"
+
+                await send_debug(
+                    bot,
+                    chat_id,
+                    f"Tool finished: {original_mcp_tool_name} ({len(result)} chars)",
+                )
+
+                if DEBUG_TOOL_RESULTS:
+                    result_preview = truncate_preview(
+                        result,
+                        DEBUG_TOOL_RESULT_PREVIEW_CHARS,
+                    )
+                    await send_debug(bot, chat_id, f"Tool result:\n{result_preview}")
 
                 tool_msg = {
                     "role": "tool",
@@ -570,14 +661,18 @@ async def complete_with_tools(
 
         assistant_msg = {"role": "assistant", "content": content}
         memory.add(chat_id, assistant_msg)
+
+        await send_debug(bot, chat_id, "Final answer ready.")
         return content
 
     return "Stopped: too many tool rounds."
 
 
-async def run_agent(chat_id: int, text: str) -> str:
+async def run_agent(chat_id: int, text: str, bot=None) -> str:
     state = memory.chat(chat_id)
     active = bool(state.get("active"))
+
+    await send_debug(bot, chat_id, "Received message. Preparing agent...")
 
     memory.add(chat_id, {"role": "user", "content": text})
 
@@ -600,10 +695,18 @@ async def run_agent(chat_id: int, text: str) -> str:
 
     if tools_enabled:
         try:
+            await send_debug(bot, chat_id, "Connecting to browser MCP...")
             async with mcp_session() as session:
+                await send_debug(bot, chat_id, "Listing MCP tools...")
                 listed = await session.list_tools()
                 mcp_tools = getattr(listed, "tools", []) or []
                 tools, tool_name_map = mcp_tools_to_openai_tools(mcp_tools)
+
+                await send_debug(
+                    bot,
+                    chat_id,
+                    f"MCP connected. {len(tools)} tools available.",
+                )
 
                 return await complete_with_tools(
                     chat_id=chat_id,
@@ -612,15 +715,19 @@ async def run_agent(chat_id: int, text: str) -> str:
                     tool_name_map=tool_name_map,
                     session=session,
                     active=active,
+                    bot=bot,
                 )
         except Exception as e:
             log.exception("MCP session failed")
+            await send_debug(bot, chat_id, f"MCP unavailable: {e}")
+
             messages.append(
                 {
                     "role": "system",
                     "content": f"MCP unavailable: {e}. Browser tools are disabled for this response.",
                 }
             )
+
             answer = await complete_with_tools(
                 chat_id=chat_id,
                 messages=messages,
@@ -628,6 +735,7 @@ async def run_agent(chat_id: int, text: str) -> str:
                 tool_name_map={},
                 session=None,
                 active=active,
+                bot=bot,
             )
             return f"MCP unavailable: {e}\n{answer}"
 
@@ -638,6 +746,7 @@ async def run_agent(chat_id: int, text: str) -> str:
         tool_name_map={},
         session=None,
         active=active,
+        bot=bot,
     )
 
 
@@ -649,6 +758,7 @@ def authorized(update: Update) -> bool:
     if not update.effective_user:
         return False
 
+    # If allowlist is empty, bot answers anyone. Set TELEGRAM_ALLOWED_USER_IDS.
     if not ALLOWED_USER_IDS:
         return True
 
@@ -715,10 +825,11 @@ async def on_text(update: Update, context):
         pass
 
     try:
-        answer = await run_agent(chat_id, update.message.text)
+        answer = await run_agent(chat_id, update.message.text, bot=context.bot)
     except Exception as e:
         log.exception("Agent run failed")
         answer = f"Error: {e}"
+        await send_debug(context.bot, chat_id, f"Error: {e}")
 
     for chunk in split_text(answer):
         await update.message.reply_text(chunk)
