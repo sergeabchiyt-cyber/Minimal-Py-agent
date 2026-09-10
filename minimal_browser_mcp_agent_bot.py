@@ -22,10 +22,12 @@ import json
 import logging
 import threading
 import time
+import asyncio
 from pathlib import Path
 from typing import Any
 from contextlib import asynccontextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import timedelta
 
 from openai import AsyncOpenAI
 from telegram import Update
@@ -112,6 +114,9 @@ DEBUG_TOOL_RESULT_PREVIEW_CHARS = int(
 DEBUG_TOOL_ARGS_PREVIEW_CHARS = int(
     os.getenv("DEBUG_TOOL_ARGS_PREVIEW_CHARS", "300")
 )
+
+MCP_TOOL_CALL_TIMEOUT = int(os.getenv("MCP_TOOL_CALL_TIMEOUT", "60"))
+MCP_SSE_READ_TIMEOUT = int(os.getenv("MCP_SSE_READ_TIMEOUT", "300"))
 
 if not TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN")
@@ -499,7 +504,10 @@ async def mcp_session():
     if not MCP_ENABLED:
         raise RuntimeError("MCP disabled")
 
-    async with streamablehttp_client(MCP_URL) as transport:
+    async with streamablehttp_client(
+        MCP_URL,
+        sse_read_timeout=timedelta(seconds=MCP_SSE_READ_TIMEOUT),
+    ) as transport:
         if isinstance(transport, (tuple, list)):
             read = transport[0]
             write = transport[1]
@@ -513,7 +521,16 @@ async def mcp_session():
 
 
 async def call_mcp_tool(session, name: str, arguments: dict) -> str:
-    result = await session.call_tool(name, arguments)
+    try:
+        result = await asyncio.wait_for(
+            session.call_tool(name, arguments),
+            timeout=MCP_TOOL_CALL_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"MCP tool call '{name}' timed out after {MCP_TOOL_CALL_TIMEOUT}s"
+        )
+
     text = serialize_mcp_result(result)
 
     if len(text) > MAX_TOOL_RESULT_CHARS:
@@ -627,6 +644,9 @@ async def complete_with_tools(
                             original_mcp_tool_name,
                             args,
                         )
+                except asyncio.TimeoutError:
+                    log.exception("MCP tool call timed out: %s", original_mcp_tool_name)
+                    result = f"Tool call timed out after {MCP_TOOL_CALL_TIMEOUT}s"
                 except Exception as e:
                     log.exception("MCP tool call failed: %s", original_mcp_tool_name)
                     result = f"Tool call failed: {e}"
