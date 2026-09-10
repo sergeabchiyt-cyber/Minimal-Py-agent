@@ -19,9 +19,12 @@ import os
 import re
 import json
 import logging
+import threading
+import time
 from pathlib import Path
 from typing import Any
 from contextlib import asynccontextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from openai import AsyncOpenAI
 from telegram import Update
@@ -58,25 +61,23 @@ log = logging.getLogger("browser-mcp-agent")
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-# Comma or space separated numeric Telegram user IDs.
-# Example: "123456789" or "123456789,987654321"
 ALLOWED_USER_IDS = {
     int(x)
     for x in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").replace(",", " ").split()
     if x.strip()
 }
 
-# OpenAI-compatible LLM config.
-# For NVIDIA NIM / other OpenAI-compatible endpoints, set LLM_BASE_URL.
 LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
 LLM_BASE_URL = os.getenv("LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or None
 LLM_MODEL = os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or ""
 
-# Your browser MCP server URL.
-# Example: http://127.0.0.1:8765/mcp
 MCP_URL = os.getenv("MCP_URL", "")
 
 MEMORY_FILE = Path(os.getenv("MEMORY_FILE", "agent_memory.json"))
+
+HEALTH_HOST = os.getenv("HEALTH_HOST", "0.0.0.0")
+HEALTH_PORT = int(os.getenv("HEALTH_PORT") or os.getenv("PORT") or "10000")
+START_TIME = time.time()
 
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
@@ -133,10 +134,6 @@ def safe_tool_name(name: str) -> str:
 
 
 def message_groups(messages: list[dict]) -> list[list[dict]]:
-    """
-    Groups assistant tool_calls together with their matching tool responses.
-    Prevents truncation from leaving orphan tool messages.
-    """
     groups: list[list[dict]] = []
     i = 0
 
@@ -171,11 +168,9 @@ def message_groups(messages: list[dict]) -> list[list[dict]]:
                 else:
                     break
 
-            # Keep only complete tool-call/tool-result groups.
             if not needed:
                 groups.append(group)
         else:
-            # Skip orphan tool messages.
             if role != "tool":
                 groups.append([msg])
             i += 1
@@ -206,9 +201,6 @@ def safe_tail(messages: list[dict], limit: int) -> list[dict]:
 
 
 def sanitize_schema(schema: Any) -> dict:
-    """
-    Minimal OpenAI-compatible JSON schema sanitizer.
-    """
     if not isinstance(schema, dict):
         return {"type": "object", "properties": {}}
 
@@ -234,12 +226,6 @@ def sanitize_schema(schema: Any) -> dict:
 
 
 def mcp_tools_to_openai_tools(tools: list) -> tuple[list[dict], dict[str, str]]:
-    """
-    Converts MCP tools to OpenAI function tools.
-    Returns:
-      tools, name_map
-      name_map maps sanitized OpenAI function name -> original MCP tool name.
-    """
     out: list[dict] = []
     name_map: dict[str, str] = {}
     used: set[str] = set()
@@ -304,11 +290,6 @@ def serialize_mcp_result(result: Any) -> str:
 # -----------------------------
 
 class Memory:
-    """
-    RAM context for all chats.
-    Disk persistence only for chats where active == True.
-    """
-
     def __init__(self, path: Path):
         self.path = path
         self.data: dict[str, dict] = {}
@@ -329,7 +310,6 @@ class Memory:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Persist only active chats.
             persistent = {
                 chat_id: state
                 for chat_id, state in self.data.items()
@@ -376,6 +356,80 @@ class Memory:
 
 
 memory = Memory(MEMORY_FILE)
+
+
+# -----------------------------
+# Health endpoint
+# -----------------------------
+
+class HealthHandler(BaseHTTPRequestHandler):
+    server_version = "AgentHealth/1.0"
+
+    def log_message(self, format, *args):
+        pass
+
+    def _path(self) -> str:
+        path = self.path.split("?", 1)[0]
+        if len(path) > 1:
+            path = path.rstrip("/")
+        return path or "/"
+
+    def _payload(self) -> dict:
+        return {
+            "ok": True,
+            "service": "telegram-browser-mcp-agent",
+            "uptime_sec": int(time.time() - START_TIME),
+            "mcp_enabled": MCP_ENABLED,
+            "mcp_import_ok": MCP_IMPORT_OK,
+            "mcp_url_configured": bool(MCP_URL),
+            "llm_model_configured": bool(LLM_MODEL),
+            "telegram_allowlist_configured": bool(ALLOWED_USER_IDS),
+        }
+
+    def _send(self, code: int, payload: dict | None = None, head_only: bool = False):
+        body = b"" if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+
+        if not head_only and body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        path = self._path()
+
+        if path == "/health":
+            self._send(200, self._payload())
+        elif path == "/":
+            self._send(200, {"ok": True, "endpoints": ["/health"]})
+        else:
+            self._send(404, {"ok": False, "error": "not found"})
+
+    def do_HEAD(self):
+        path = self._path()
+
+        if path == "/health":
+            self._send(200, head_only=True)
+        elif path == "/":
+            self._send(200, head_only=True)
+        else:
+            self._send(404, head_only=True)
+
+
+def start_health_server():
+    try:
+        ThreadingHTTPServer.daemon_threads = True
+        server = ThreadingHTTPServer((HEALTH_HOST, HEALTH_PORT), HealthHandler)
+    except OSError as e:
+        log.error("Health server failed to bind %s:%s: %s", HEALTH_HOST, HEALTH_PORT, e)
+        return
+
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    log.info("Health endpoint listening on http://%s:%s/health", HEALTH_HOST, HEALTH_PORT)
 
 
 # -----------------------------
@@ -434,7 +488,6 @@ async def complete_with_tools(
                 **kwargs,
             )
         except Exception as e:
-            # If provider rejects tool schema, retry once without tools.
             if tools:
                 log.warning("LLM rejected tools; retrying without tools: %s", e)
                 tools = []
@@ -596,7 +649,6 @@ def authorized(update: Update) -> bool:
     if not update.effective_user:
         return False
 
-    # If allowlist is empty, bot answers anyone. Set TELEGRAM_ALLOWED_USER_IDS.
     if not ALLOWED_USER_IDS:
         return True
 
@@ -683,6 +735,8 @@ def main():
         log.warning(
             "MCP disabled. Set MCP_URL and install MCP SDK to enable browser tools."
         )
+
+    start_health_server()
 
     app = Application.builder().token(TOKEN).build()
 
