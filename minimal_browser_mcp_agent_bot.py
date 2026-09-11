@@ -86,7 +86,13 @@ SYSTEM_PROMPT = os.getenv(
     (
         "You are Serge's private operator assistant. Be terse and precise. "
         "Use browser MCP tools only when the user explicitly asks to fetch, read, "
-        "open, extract, click, navigate, or otherwise act on browser data."
+        "open, extract, click, navigate, or otherwise act on browser data.\n\n"
+        "Tool usage rules:\n"
+        "- Always validate arguments match the tool schema before calling.\n"
+        "- If a tool returns InvalidParams, inspect the error, correct the arguments, and retry.\n"
+        "- Pass only valid JSON types (string, number, boolean, array, object, null).\n"
+        "- Never pass undefined, NaN, or malformed JSON.\n"
+        "- If unsure about tool parameters, ask the user for clarification instead of guessing."
     ),
 )
 
@@ -94,6 +100,7 @@ MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "30"))
 MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "220"))
 MAX_CONTEXT_MESSAGES = int(os.getenv("MAX_CONTEXT_MESSAGES", "80"))
 MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "12000"))
+MAX_INVALID_PARAMS_RETRIES = int(os.getenv("MAX_INVALID_PARAMS_RETRIES", "2"))
 
 TELEGRAM_DEBUG = os.getenv("TELEGRAM_DEBUG", "1").strip().lower() not in {
     "0",
@@ -549,6 +556,8 @@ async def complete_with_tools(
     active: bool,
     bot=None,
 ) -> str:
+    invalid_params_count = {}
+    
     for round_num in range(1, MAX_TOOL_ROUNDS + 1):
         await send_debug(bot, chat_id, f"Thinking... (round {round_num}/{MAX_TOOL_ROUNDS})")
 
@@ -645,8 +654,29 @@ async def complete_with_tools(
                     log.exception("MCP tool call timed out: %s", original_mcp_tool_name)
                     result = f"Tool call timed out after {MCP_TOOL_CALL_TIMEOUT}s"
                 except Exception as e:
-                    log.exception("MCP tool call failed: %s", original_mcp_tool_name)
-                    result = f"Tool call failed: {e}"
+                    error_str = str(e)
+                    log.error("MCP tool call failed: %s | args=%s | error=%s", 
+                             original_mcp_tool_name, args, error_str)
+                    
+                    # Track retries per tool to prevent infinite loops
+                    tool_key = original_mcp_tool_name
+                    invalid_params_count[tool_key] = invalid_params_count.get(tool_key, 0) + 1
+                    
+                    if invalid_params_count[tool_key] > MAX_INVALID_PARAMS_RETRIES:
+                        result = (
+                            f"Tool '{original_mcp_tool_name}' has failed {MAX_INVALID_PARAMS_RETRIES} times with invalid parameters. "
+                            f"Last error: {error_str}. Please verify the correct tool and parameters, or ask the user for help."
+                        )
+                    elif "InvalidParams" in error_str or "invalid params" in error_str.lower():
+                        result = (
+                            f"Error: Invalid parameters for tool '{original_mcp_tool_name}'. "
+                            f"The MCP server rejected your arguments: {args}. "
+                            f"Server error: {error_str}. "
+                            f"Retry attempt {invalid_params_count[tool_key]}/{MAX_INVALID_PARAMS_RETRIES}. "
+                            f"Please check the tool schema and retry with corrected arguments."
+                        )
+                    else:
+                        result = f"Tool call failed: {error_str}"
 
                 await send_debug(
                     bot,
